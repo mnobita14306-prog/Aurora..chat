@@ -8,30 +8,6 @@
    01-phone-shell.js · SETUP 1 · storage fallback + phone-shell wrapper
    ========================================================================== */
 
-/* Sandboxed previews (an iframe with an opaque origin) and some private-mode
-   browsers THROW the moment localStorage is touched. Aurora reads it during
-   startup, so one throw would leave a blank screen. Swap in an in-memory store
-   for those cases; every other reference in the app keeps working unchanged. */
-(function(){
-  try{
-    window.localStorage.setItem('aurora_storage_probe','1');
-    window.localStorage.removeItem('aurora_storage_probe');
-    return;                                  // real storage works — nothing to do
-  }catch(e){}
-  var mem={};
-  var facade={
-    getItem:function(k){ return Object.prototype.hasOwnProperty.call(mem,String(k)) ? mem[String(k)] : null; },
-    setItem:function(k,v){ mem[String(k)]=String(v); },
-    removeItem:function(k){ delete mem[String(k)]; },
-    clear:function(){ mem={}; },
-    key:function(i){ return Object.keys(mem)[i] ?? null; }
-  };
-  Object.defineProperty(facade,'length',{get:function(){ return Object.keys(mem).length; }});
-  try{ Object.defineProperty(window,'localStorage',{value:facade,configurable:true}); }
-  catch(e2){ try{ window.localStorage=facade; }catch(e3){} }
-  try{ console.info('Aurora: browser storage is unavailable here — running in memory-only guest mode.'); }catch(e4){}
-})();
-
 // Force phone shell — ALL UI lives inside #phoneShell
 (function(){
   function getShell(){
@@ -429,6 +405,30 @@
    04-app.js · THE APP
    ========================================================================== */
 
+/* Startups can run where browser storage is simply not available: a sandboxed
+   preview iframe with an opaque origin, or Safari private mode. Aurora reads
+   localStorage during boot, and one throw there would leave a blank screen.
+   Install an in-memory stand-in first; every other reference keeps working. */
+(function(){
+  try{
+    window.localStorage.setItem('aurora_storage_probe','1');
+    window.localStorage.removeItem('aurora_storage_probe');
+    return;                                  // real storage works — nothing to do
+  }catch(e){}
+  var mem={};
+  var facade={
+    getItem:function(k){ return Object.prototype.hasOwnProperty.call(mem,String(k)) ? mem[String(k)] : null; },
+    setItem:function(k,v){ mem[String(k)]=String(v); },
+    removeItem:function(k){ delete mem[String(k)]; },
+    clear:function(){ mem={}; },
+    key:function(i){ var ks=Object.keys(mem); return i<ks.length?ks[i]:null; }
+  };
+  try{ Object.defineProperty(facade,'length',{get:function(){ return Object.keys(mem).length; }}); }catch(e){}
+  try{ Object.defineProperty(window,'localStorage',{value:facade,configurable:true}); }
+  catch(e2){ try{ window.localStorage=facade; }catch(e3){} }
+  try{ console.info('Aurora: browser storage is unavailable here — running in memory-only guest mode.'); }catch(e4){}
+})();
+
 // Capture the pristine app before authentication/chat rendering. Exports use
 // this template, never the live DOM containing account or conversation data.
 const AURORA_EXPORT_BASE='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
@@ -773,9 +773,13 @@ function sbApplyConstraints(builder, constraints){
 async function sbSelect(target){
   const route=target.route;
   let builder=sb.from(route.table).select('*');
-  if(target.segs.length===1 && target.route.pk && target.route.pk.length){
-    // root collection: nothing extra
-  }
+  /* CRITICAL: a subcollection lives in the same table as every other parent's
+     rows (rooms/{id}/messages, voice_calls/{id}/callerCandidates, …), so the
+     parent key MUST be applied here. Without it, a chat would render messages
+     from every room and a call would feed other calls' ICE candidates into its
+     peer connection. */
+  const fixed=route.fixed||{};
+  if(Object.keys(fixed).length) builder=builder.match(fixed);
   builder=sbApplyConstraints(builder,target.constraints||[]);
   const { data, error }=await builder;
   if(error) throw new Error(sbErr(error));
@@ -806,6 +810,8 @@ function sbSubscribeChanges(route, onChange){
     const cfg={event:'*', schema:'public', table:route.table};
     const fixedCols=Object.keys(route.fixed||{});
     if(fixedCols.length){
+      /* Realtime accepts one filter column; the refetch narrows the rest.
+         Filtering on the parent key keeps unrelated traffic out of the channel. */
       const c=fixedCols[0];
       cfg.filter=c+'=eq.'+String(route.fixed[c]);
     }
@@ -11225,10 +11231,9 @@ window.AuroraSoundLibrary=(function(){
     await playNotifSound(id,{preview:true});
   }
   async function dataURL(blob){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(new Error('Could not embed the sound.'));r.readAsDataURL(blob);});}
-/* The app now lives in separate files (index.html + styles/ + scripts/), so a
-   downloaded "single HTML" must have those files folded back in, otherwise the
-   export would reference missing stylesheets. External URLs (Google Fonts) are
-   left alone. */
+/* Fold locally-served stylesheets/scripts back into a snapshot, so a downloaded
+   "single HTML" stays self-contained now that the app lives in separate files.
+   External URLs (Google Fonts) are left alone. */
 async function inlineLocalAssets(doc){
   const links=[...doc.querySelectorAll('link[rel="stylesheet"][href]')];
   for(const link of links){
@@ -11908,7 +11913,40 @@ let currentCallId=null, callTimerInterval=null;
 let isMuted=false;
 let incomingCallData=null;
 let unsubIncomingCalls=null, unsubCallDoc=null, unsubCallerCandidates=null, unsubCalleeCandidates=null;
-const rtcConfig={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]};
+/* ICE servers used to find a path between the two phones.
+   STUN alone only works when both sides can be reached directly — on mobile
+   data (carrier-grade NAT) that often fails and the call rings but never
+   connects. TURN relays the audio in that case, which is why the free public
+   relay below is included as a fallback. For anything beyond testing, swap in
+   your own TURN credentials (metered.ca, Twilio, or self-hosted coturn) —
+   replace AURORA_TURN_URLS / AURORA_TURN_USER / AURORA_TURN_PASS. */
+const AURORA_TURN_URLS = ['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443'];
+const AURORA_TURN_USER = 'openrelayproject';
+const AURORA_TURN_PASS = 'openrelayproject';
+const AURORA_ICE_SERVERS = [
+  {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
+  ...AURORA_TURN_URLS.map(urls=>({urls, username:AURORA_TURN_USER, credential:AURORA_TURN_PASS}))
+];
+const rtcConfig={iceServers:AURORA_ICE_SERVERS, iceCandidatePoolSize:2};
+
+/* Show what the connection is actually doing, so a failed call says why
+   instead of just sitting there in silence. */
+function watchCallConnection(connection){
+  const label=(text)=>{ const el=document.querySelector('#activeCallSub'); if(el) el.textContent=text; };
+  try{
+    connection.addEventListener('iceconnectionstatechange',()=>{
+      const st=connection.iceConnectionState;
+      if(st==='checking') label('Connecting…');
+      else if(st==='connected'||st==='completed') label('Voice • Connected');
+      else if(st==='disconnected') label('Reconnecting…');
+      else if(st==='failed') label('Connection failed — check network / TURN');
+      else if(st==='closed') label('Call ended');
+    });
+    connection.addEventListener('connectionstatechange',()=>{
+      if(connection.connectionState==='failed') label('Connection failed — check network / TURN');
+    });
+  }catch(e){}
+}
 
 function getOtherUserFromRoom(){
   if(!currentRoomId || !currentUserData) return null;
@@ -11928,8 +11966,10 @@ async function startVoiceCall(){
   $('#outgoingCallName').textContent=otherContact? (otherContact.nickname||otherContact.name) : other;
   const av=$('#outgoingCallAvatar'); if(otherContact){av.innerHTML=avHTML(otherContact); av.style.background=avBg(otherContact,otherContact.color); av.style.overflow='hidden'; av.style.display='flex';}
   $('#outgoingCallModal').classList.add('show');
+  { const ws=$('#outgoingCallStatus'); if(ws) ws.textContent='Ringing • Voice'; }
   try{
     pc=new RTCPeerConnection(rtcConfig);
+    watchCallConnection(pc);
     localStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
     localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     remoteStream=new MediaStream();
@@ -11942,10 +11982,19 @@ async function startVoiceCall(){
     await setDoc(doc(db,'voice_calls',callId),{caller:currentUserData.username,callerUid:currentUser.uid,callerNickname:currentUserData.nickname||currentUserData.username,callee:other,offer:{type:offer.type,sdp:offer.sdp},status:'ringing',createdAt:serverTimestamp(),roomId:currentRoomId});
     const {onSnapshot}=AURORA_SB;
     const {collection,query}=AURORA_SB;
+    let callerJoined=false;
     unsubCallDoc=onSnapshot(doc(db,'voice_calls',callId),async snap=>{
       const data=snap.data(); if(!data) return;
-      if(data.answer && !pc.currentRemoteDescription){
-        try{await pc.setRemoteDescription(new RTCSessionDescription(data.answer));}catch{}
+      if(data.answer && pc && !pc.currentRemoteDescription){
+        try{await pc.setRemoteDescription(new RTCSessionDescription(data.answer));}
+        catch(e){ console.log('Could not apply the answer', e.message); }
+      }
+      /* Accepted (or an answer arrived) → switch the caller to the live screen
+         straight away; waiting for the status field alone could leave the caller
+         ringing if a network hiccup dropped that one update. */
+      if(!callerJoined && (data.status==='accepted' || (data.answer && pc && pc.currentRemoteDescription))){
+        callerJoined=true;
+        enterActiveCallUI(otherContact, other);
       }
       if(data.status==='rejected'){endVoiceCallUI('Declined');}
       if(data.status==='ended'){endVoiceCallUI('Ended');}
@@ -11955,6 +12004,8 @@ async function startVoiceCall(){
       snap.docChanges().forEach(ch=>{if(ch.type==='added'){try{pc.addIceCandidate(new RTCIceCandidate(ch.doc.data()));}catch{}}});
     });
     setTimeout(()=>{if($('#outgoingCallModal').classList.contains('show')){endVoiceCallUI('No answer'); updateCallStatus(callId,'ended');}},45000);
+    /* Callee-side ring timeout too, so a missed call never leaves a stuck modal. */
+    setTimeout(()=>{if($('#activeCallModal').classList.contains('show') && pc && pc.connectionState!=='connected'){endVoiceCallUI('No answer'); updateCallStatus(callId,'ended');}},60000);
   }catch(e){alert('Call error: '+e.message); endVoiceCallUI('Failed');}
 }
 
@@ -11964,12 +12015,16 @@ async function acceptVoiceCall(){
   const callId=incomingCallData.id;
   currentCallId=callId;
   $('#incomingCallModal').classList.remove('show');
-  $('#activeCallName').textContent=incomingCallData.callerNickname||incomingCallData.caller;
-  $('#activeCallAvatar').textContent=(incomingCallData.callerNickname||incomingCallData.caller).slice(0,2).toUpperCase();
+  try{
+    const nm=$('#activeCallName'); if(nm) nm.textContent=incomingCallData.callerNickname||incomingCallData.caller;
+    const av=$('#activeCallAvatar'); if(av) av.textContent=(incomingCallData.callerNickname||incomingCallData.caller).slice(0,2).toUpperCase();
+    const sub=$('#activeCallSub'); if(sub) sub.textContent='Voice • Connecting…';
+  }catch(e){}
   $('#activeCallModal').classList.add('show');
   startCallTimer();
   try{
     pc=new RTCPeerConnection(rtcConfig);
+    watchCallConnection(pc);
     localStream=await navigator.mediaDevices.getUserMedia({audio:true});
     localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     remoteStream=new MediaStream();
@@ -12023,6 +12078,27 @@ function endVoiceCallUI(reason){
 async function updateCallStatus(callId,status){
   if(!db) return;
   try{const {doc,updateDoc}=AURORA_SB; await updateDoc(doc(db,'voice_calls',callId),{status});}catch{}
+}
+
+/* Move the CALLER from "Ringing…" to the live call screen as soon as the other
+   side accepts. Without this the caller stayed on the ringing modal forever. */
+function enterActiveCallUI(contact, fallbackName){
+  try{
+    $('#outgoingCallModal').classList.remove('show');
+    const nameEl=$('#activeCallName');
+    if(nameEl) nameEl.textContent=(contact&&(contact.nickname||contact.name))||fallbackName||'Connected';
+    const avEl=$('#activeCallAvatar');
+    if(avEl){
+      if(contact){ avEl.innerHTML=avHTML(contact); avEl.style.background=avBg(contact,contact.color); avEl.style.overflow='hidden'; avEl.style.display='flex'; }
+      else { avEl.textContent=String(fallbackName||'?').slice(0,2).toUpperCase(); }
+    }
+    const sub=$('#activeCallSub');
+    if(sub) sub.textContent='Voice • Connecting…';
+    $('#activeCallModal').classList.add('show');
+    startCallTimer();
+    /* iOS/Safari refuse to autoplay audio that no tap unlocked: nudge it. */
+    try{ const a=$('#remoteAudio'); if(a&&a.play) a.play().catch(()=>{}); }catch(e){}
+  }catch(e){}
 }
 
 function startCallTimer(){
